@@ -1,9 +1,9 @@
 # main.py
 import os, sqlite3, time, secrets, string, threading, csv, tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from flask import Flask, request, redirect, abort
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from zipfile import ZipFile, ZIP_DEFLATED
 
@@ -19,9 +19,18 @@ ANTI_BURST_S = int(os.getenv("ANTI_BURST_SECONDS", "10"))  # запрет пов
 REPORT_CHAT_ID = os.getenv("REPORT_CHAT_ID", "").strip()   # куда слать отчёты (канал/чат/user), бот должен быть там админом
 MAX_EXPORT_MB  = int(os.getenv("MAX_EXPORT_MB", "15"))
 
+# Валидация обязательных ENV переменных
+if not BOT_TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN не задан в .env файле")
+if not CHANNEL_ID:
+    raise ValueError("CHANNEL_ID не задан в .env файле")
+if OWNER_ID == 0:
+    raise ValueError("OWNER_ID не задан в .env файле")
+
 # ---------- DB ----------
 DB = "store.sqlite3"
 conn = sqlite3.connect(DB, check_same_thread=False)
+db_lock = threading.Lock()  # Thread safety для доступа к БД
 cur = conn.cursor()
 cur.execute("""CREATE TABLE IF NOT EXISTS posts(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,28 +88,29 @@ def _last_hit_ts(redirect_id:int, ip:str)->int|None:
 
 @flask_app.get("/r/<token>")
 def go(token):
-    c = conn.cursor()
-    c.execute("SELECT id, target_url FROM redirects WHERE token = ?", (token,))
-    row = c.fetchone()
-    if not row:
-        return abort(404)
-    rid, url = row
-    now = int(time.time())
-    ip = request.remote_addr or ""
-    ua = request.headers.get("User-Agent","")
-    ref = request.headers.get("Referer","")
+    with db_lock:
+        c = conn.cursor()
+        c.execute("SELECT id, target_url FROM redirects WHERE token = ?", (token,))
+        row = c.fetchone()
+        if not row:
+            return abort(404)
+        rid, url = row
+        now = int(time.time())
+        ip = request.remote_addr or ""
+        ua = request.headers.get("User-Agent","")
+        ref = request.headers.get("Referer","")
 
-    # anti-burst: игнорим запись, если с этого IP был хит < ANTI_BURST_S сек назад
-    if ANTI_BURST_S > 0:
-        last_ts = _last_hit_ts(rid, ip)
-        if last_ts is None or (now - last_ts) >= ANTI_BURST_S:
+        # anti-burst: игнорим запись, если с этого IP был хит < ANTI_BURST_S сек назад
+        if ANTI_BURST_S > 0:
+            last_ts = _last_hit_ts(rid, ip)
+            if last_ts is None or (now - last_ts) >= ANTI_BURST_S:
+                c.execute("INSERT INTO redirect_hits(redirect_id, ts, ip, ua, referer) VALUES(?,?,?,?,?)",
+                          (rid, now, ip, ua, ref))
+                conn.commit()
+        else:
             c.execute("INSERT INTO redirect_hits(redirect_id, ts, ip, ua, referer) VALUES(?,?,?,?,?)",
                       (rid, now, ip, ua, ref))
             conn.commit()
-    else:
-        c.execute("INSERT INTO redirect_hits(redirect_id, ts, ip, ua, referer) VALUES(?,?,?,?,?)",
-                  (rid, now, ip, ua, ref))
-        conn.commit()
 
     return redirect(url, code=302)
 
@@ -115,11 +125,12 @@ def create_redirect(post_msg_id:int, item_idx:int, target_url:str)->str:
     for _ in range(5):
         token = rand_token(10)
         try:
-            conn.execute(
-                "INSERT INTO redirects(token, post_msg_id, item_idx, target_url, created_at) VALUES(?,?,?,?,?)",
-                (token, post_msg_id, item_idx, target_url, int(time.time()))
-            )
-            conn.commit()
+            with db_lock:
+                conn.execute(
+                    "INSERT INTO redirects(token, post_msg_id, item_idx, target_url, created_at) VALUES(?,?,?,?,?)",
+                    (token, post_msg_id, item_idx, target_url, int(time.time()))
+                )
+                conn.commit()
             return f"{BASE_URL}/r/{token}"
         except sqlite3.IntegrityError:
             continue
@@ -169,9 +180,10 @@ async def post_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text="\n".join(lines),
         disable_web_page_preview=True
     )
-    conn.execute("INSERT INTO posts(channel_msg_id, created_at) VALUES(?,?)",
-                 (msg.message_id, int(time.time())))
-    conn.commit()
+    with db_lock:
+        conn.execute("INSERT INTO posts(channel_msg_id, created_at) VALUES(?,?)",
+                     (msg.message_id, int(time.time())))
+        conn.commit()
 
     kb_rows = []
     for i, it in enumerate(items, 1):
@@ -205,10 +217,10 @@ async def post_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     uid = q.from_user.id
     parts = (q.data or "").split(":")  # rate:item:2 | rate:all:🔥
     if len(parts) < 3:
+        await q.answer("Неверный формат данных.")
         return
     kind = parts[1]
     if kind == "item":
@@ -220,15 +232,16 @@ async def on_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         emoji = parts[2]
         sent = sentiment_of(emoji)
 
-    conn.execute(
-        "INSERT INTO rates(post_msg_id,item_idx,user_id,emoji,sentiment,kind,ts) VALUES(?,?,?,?,?,?,?)",
-        (q.message.message_id, item_idx, uid, emoji, sent, kind, int(time.time()))
-    )
-    conn.commit()
+    with db_lock:
+        conn.execute(
+            "INSERT INTO rates(post_msg_id,item_idx,user_id,emoji,sentiment,kind,ts) VALUES(?,?,?,?,?,?,?)",
+            (q.message.message_id, item_idx, uid, emoji, sent, kind, int(time.time()))
+        )
+        conn.commit()
     await q.answer("Принято.")
 
 def stats_last_days(days:int):
-    since_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+    since_ts = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
     c = conn.cursor()
 
     c.execute("SELECT channel_msg_id FROM posts WHERE created_at >= ?", (since_ts,))
@@ -361,7 +374,7 @@ async def cmd_export_clicks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 return await update.message.reply_text("post_id должен быть числом (message_id поста в канале).")
     else:
-        d2 = datetime.utcnow()
+        d2 = datetime.now(timezone.utc)
         d1 = d2 - timedelta(days=7)
 
     start_ts = int(datetime(d1.year, d1.month, d1.day, 0, 0, 0).timestamp())
@@ -388,33 +401,45 @@ async def cmd_export_clicks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Пишем CSV
     fd, path = tempfile.mkstemp(prefix="clicks_", suffix=".csv")
     os.close(fd)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["ts_iso","post_msg_id","item_idx","ip","user_agent","referer","token","target_url"])
-        for ts, post_id, idx, ip, ua, ref, token, url in rows:
-            w.writerow([datetime.utcfromtimestamp(ts).isoformat(), post_id, idx, ip, ua, ref, token, url])
+    try:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["ts_iso","post_msg_id","item_idx","ip","user_agent","referer","token","target_url"])
+            for ts, post_id, idx, ip, ua, ref, token, url in rows:
+                w.writerow([datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(), post_id, idx, ip, ua, ref, token, url])
 
-    # Лимит размера → zip при необходимости
-    send_path, disp_name = _zip_if_too_big(path, MAX_EXPORT_MB)
+        # Лимит размера → zip при необходимости
+        send_path, disp_name = _zip_if_too_big(path, MAX_EXPORT_MB)
 
-    # Куда отправляем отчёт
-    target_chat = _target_report_chat(update)
-    if target_chat is None:
-        return await update.message.reply_text("Не удалось определить чат для отправки отчёта.")
+        # Куда отправляем отчёт
+        target_chat = _target_report_chat(update)
+        if target_chat is None:
+            return await update.message.reply_text("Не удалось определить чат для отправки отчёта.")
 
-    caption = f"Экспорт кликов {d1.date()} — {d2.date()}"
-    if post_id_filter is not None:
-        caption += f" | post_id={post_id_filter}"
-    if os.path.getsize(send_path) > MAX_EXPORT_MB * 1024 * 1024 and send_path.endswith(".zip"):
-        caption += f"\n⚠️ Файл всё ещё больше {MAX_EXPORT_MB} МБ. Сузь диапазон дат или укажи post_id."
+        caption = f"Экспорт кликов {d1.date()} — {d2.date()}"
+        if post_id_filter is not None:
+            caption += f" | post_id={post_id_filter}"
+        if os.path.getsize(send_path) > MAX_EXPORT_MB * 1024 * 1024 and send_path.endswith(".zip"):
+            caption += f"\n⚠️ Файл всё ещё больше {MAX_EXPORT_MB} МБ. Сузь диапазон дат или укажи post_id."
 
-    await context.bot.send_document(
-        chat_id=target_chat,
-        document=InputFile(send_path, filename=disp_name),
-        caption=caption
-    )
-    if str(target_chat) != str(update.effective_chat.id):
-        await update.message.reply_text("Готово: отчёт отправлен в REPORT_CHAT_ID.")
+        with open(send_path, 'rb') as doc:
+            await context.bot.send_document(
+                chat_id=target_chat,
+                document=doc,
+                filename=disp_name,
+                caption=caption
+            )
+        if str(target_chat) != str(update.effective_chat.id):
+            await update.message.reply_text("Готово: отчёт отправлен в REPORT_CHAT_ID.")
+    finally:
+        # Удаляем временные файлы
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            if send_path != path and os.path.exists(send_path):
+                os.remove(send_path)
+        except Exception:
+            pass  # Игнорируем ошибки удаления
 
 def main():
     # Flask редирект
